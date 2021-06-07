@@ -31,6 +31,8 @@ namespace Oxide.Core.Plugins.Watchers
 
         private Timer timers;
 
+        private Dictionary<string, FileSystemWatcher> m_symlinkWatchers = new Dictionary<string, FileSystemWatcher>();
+
         /// <summary>
         /// Initializes a new instance of the FSWatcher class
         /// </summary>
@@ -45,11 +47,66 @@ namespace Oxide.Core.Plugins.Watchers
             if (Interface.Oxide.Config.Options.PluginWatchers)
             {
                 LoadWatcher(directory, filter);
+
+                // watch symlinked files
+                if (Environment.OSVersion.Platform == PlatformID.Unix)
+                {
+                    var files = new DirectoryInfo(directory).GetFiles(filter);
+                    foreach (var fileInfo in files)
+                    {
+                        if(IsFileSymlink(fileInfo.FullName))
+                        {
+                            LoadWatcherSymlink(fileInfo.FullName);
+                        }
+                    }
+                }
             }
             else
             {
                 Interface.Oxide.LogWarning("Automatic plugin reloading and unloading has been disabled");
             }
+        }
+
+        bool IsFileSymlink(string path)
+        {
+            var fileAttributes = File.GetAttributes(path);
+            var isSymlink = (fileAttributes & FileAttributes.ReparsePoint) > 0;
+            return isSymlink;
+        }
+
+        // TODO: replace with syscall. But this adds the least code and does not require a Linux and Windows Oxide.Core to be seperated
+        private string GetSymlinkPath(string path)
+        {
+            var p = new System.Diagnostics.Process();
+            p.StartInfo.FileName = "readlink";
+            p.StartInfo.Arguments = string.Format("-f {0}", path);
+            p.StartInfo.UseShellExecute = false;
+            p.StartInfo.RedirectStandardOutput = true;
+            p.Start();
+            return p.StandardOutput.ReadToEnd().Trim();
+        }
+
+        [PermissionSet(SecurityAction.Demand, Name = "FullTrust")]
+        private void LoadWatcherSymlink(string symlinkPath)
+        {
+            var realPath = GetSymlinkPath(symlinkPath);
+            var realDirName = Path.GetDirectoryName(realPath);
+            var realFileName = Path.GetFileName(realPath);
+
+            void symlinkTarget_Changed(object sender, FileSystemEventArgs e)
+            {
+                watcher_Changed(sender, e);
+            }
+
+            var w = new FileSystemWatcher(realDirName, realFileName);
+            m_symlinkWatchers[symlinkPath] = w;
+            w.Changed += symlinkTarget_Changed;
+            w.Created += symlinkTarget_Changed;
+            w.Deleted += symlinkTarget_Changed;
+            w.Error += watcher_Error;
+            w.NotifyFilter = NotifyFilters.LastWrite;
+            w.IncludeSubdirectories = false;
+            w.EnableRaisingEvents = true;
         }
 
         /// <summary>
@@ -132,10 +189,32 @@ namespace Oxide.Core.Plugins.Watchers
                         return;
                     }
                     change.type = WatcherChangeTypes.Deleted;
+
                     break;
             }
             Interface.Oxide.NextTick(() =>
             {
+                if (Environment.OSVersion.Platform == PlatformID.Unix)
+                {
+                    switch (e.ChangeType)
+                    {
+                        case WatcherChangeTypes.Created:
+                            if (IsFileSymlink(e.FullPath))
+                            {
+                                LoadWatcherSymlink(e.FullPath);
+                            }
+                            break;
+                        case WatcherChangeTypes.Deleted:
+                            if (m_symlinkWatchers.ContainsKey(e.FullPath))
+                            {
+                                m_symlinkWatchers.TryGetValue(e.FullPath, out FileSystemWatcher symlinkWatcher);
+                                symlinkWatcher?.Dispose();
+                                m_symlinkWatchers.Remove(e.FullPath);
+                            }
+                            break;
+                    }
+                }
+
                 change.timer?.Destroy();
                 change.timer = timers.Once(.2f, () =>
                 {
